@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <sstream>
 #include <Windows.h>
 #include <string>
 #include <functional>
@@ -18,6 +19,21 @@
 #pragma warning(push, 0)
 #include <boost/gil/extension/io/bmp.hpp>
 #pragma warning(pop)
+
+void ThrowInvalidCommandLineArguments()
+{
+	using namespace std::string_literals;
+	throw std::exception(("Invalid command line arguments. Should be:\n"s
+		+ "EXE <input_file_name> <output_file_name> <threads_count> <cores_count> <thread_priorities>\n"
+		+ "Thread priorities:\n"
+		+ "	0 - ABOVE_NORMAL\n"
+		+ "	1 - BELOW_NORMAL\n"
+		+ "	2 - HIGHEST\n"
+		+ "	3 - IDLE\n"
+		+ "	4 - LOWEST\n"
+		+ "	5 - NORMAL\n"
+		+ "	6 - TIME_CRTICIAL\n").c_str());
+}
 
 struct RGBHolder
 {
@@ -146,7 +162,7 @@ BitHolder MergeBitHolder(std::vector<BitHolder> && bitmaps, size_t width, size_t
 	return { std::move(totalBluredPixels), width, height };
 }
 
-std::vector<BitHolder> SeparateBitHolder(const BitHolder& bmp, size_t bunchSize)
+std::vector<BitHolder> SeparateBitHolder(const BitHolder & bmp, size_t bunchSize)
 {
 	const size_t processingHeight = bmp.Height() / bunchSize;
 
@@ -159,9 +175,37 @@ std::vector<BitHolder> SeparateBitHolder(const BitHolder& bmp, size_t bunchSize)
 	return bunches;
 }
 
+int ToWinThreadPriority(char priority)
+{
+	switch (priority)
+	{
+	case 0:
+		return THREAD_PRIORITY_ABOVE_NORMAL;
+	case 1:
+		return THREAD_PRIORITY_BELOW_NORMAL;
+	case 2:
+		return THREAD_PRIORITY_HIGHEST;
+	case 3:
+		return THREAD_PRIORITY_IDLE;
+	case 4:
+		return THREAD_PRIORITY_LOWEST;
+	case 5:
+		return THREAD_PRIORITY_NORMAL;
+	case 6:
+		return THREAD_PRIORITY_TIME_CRITICAL;
+	default:
+		throw std::exception("Unknown ThreadPriority");
+	}
+}
+
 void SetThreadAffinityMask(std::thread & thread, size_t coresCount)
 {
 	SetThreadAffinityMask(thread.native_handle(), (1 << coresCount) - 1);
+}
+
+void SetThread(std::thread& thread, char priority)
+{
+	SetThreadPriority(thread.native_handle(), ToWinThreadPriority(priority));
 }
 
 bool IsNumber(const std::string_view & str)
@@ -190,7 +234,22 @@ size_t ExtractPositiveNumber(std::string_view arg)
 	}
 }
 
-BitHolder BlurBitHolder(const BitHolder& bmp)
+std::vector<char> ExtractThreadPriorities(size_t threadsCount, size_t argc, char* argv[], int shift = 0)
+{
+	if (argc != (threadsCount + 5 + shift))
+	{
+		throw std::exception();
+	}
+	std::vector<char> threadPriorities;
+	threadPriorities.reserve(threadsCount);
+	for (size_t i = 5 + shift; i < argc; ++i)
+	{
+		threadPriorities.push_back(std::stoi(argv[i]));
+	}
+	return threadPriorities;
+}
+
+BitHolder BlurBitHolder(const BitHolder & bmp, std::ostream& log, clock_t beginTime, size_t threadNum)
 {
 	std::vector<RGBHolder> pixels;
 	pixels.reserve(bmp.Width() * bmp.Height());
@@ -229,46 +288,66 @@ BitHolder BlurBitHolder(const BitHolder& bmp)
 				static_cast<uint8_t>(g / (matrixOrder - nulloptCount)),
 				static_cast<uint8_t>(b / (matrixOrder - nulloptCount))
 				});
+			log << "[" << threadNum << "] " << std::clock() - beginTime << "ms" << std::endl;
 		}
 	}
 	return { pixels, bmp.Width(), bmp.Height() };
 }
 
 
-void BlurImg(std::string_view imgInName, std::string_view imgOutName, size_t threadsCount, size_t coresCount)
+void BlurImg(std::string_view imgInName, std::string_view imgOutName, size_t threadsCount, size_t coresCount, const std::vector<char>& threadPriorities)
 {
+	const auto beginTime = std::clock();
+
 	auto [pixels, width, height] = LoadPixels(imgInName);
 	BitHolder bmp(pixels, width, height);
 
 	auto subBitmaps = SeparateBitHolder(bmp, threadsCount);
+	std::vector<std::stringstream> logs(threadsCount);
 	std::vector<std::thread> threads;
+	threads.reserve(threadsCount);
 	for (size_t i = 0; i < subBitmaps.size(); ++i)
 	{
-		threads.emplace_back([&subBitmaps, i]() {
-			subBitmaps[i] = BlurBitHolder(subBitmaps[i]);
+		threads.emplace_back([&subBitmaps, &logs, beginTime, i]() {
+			subBitmaps[i] = BlurBitHolder(subBitmaps[i], logs[i], beginTime, i);
 			});
 		SetThreadAffinityMask(threads.back(), coresCount);
+		SetThread(threads.back(), threadPriorities[i]);
 	}
 	for_each(threads.begin(), threads.end(), std::mem_fn(&std::thread::join));
 
 	const auto bluredBitmap = MergeBitHolder(std::move(subBitmaps), bmp.Width(), bmp.Height());
 	UnloadPixels(bluredBitmap.Pixels(), bmp.Width(), bmp.Height(), imgOutName.data());
+
+	for (size_t i = 0; i < logs.size(); ++i)
+	{
+		std::ofstream("thread_" + std::to_string(i) + ".log") << logs[i].str();
+	}
 }
 
 int main(int argc, char* argv[])
 {
 	try
 	{
-		if (argc != 5)
+		if (argc < 5)
 		{
 			throw std::exception("Invalid command line arguments. Should be:\nEXE <input_file_name> <output_file_name> <threads_count> <cores_count>");
 		}
 		const auto begin = std::clock();
 		const std::string imgIn = argv[1];
 		const std::string imgOut = argv[2];
-		const auto threadsCount = ExtractPositiveNumber(argv[3]);
-		const auto coresCount = ExtractPositiveNumber(argv[4]);
-		BlurImg(imgIn, imgOut, threadsCount, coresCount);
+		const auto threads = ExtractPositiveNumber(argv[3]);
+		const auto cores = ExtractPositiveNumber(argv[4]);
+		std::vector<char> threadPriorities;
+		try
+		{
+			threadPriorities = std::move(ExtractThreadPriorities(threads, argc, argv));
+		}
+		catch (const std::exception&)
+		{
+			ThrowInvalidCommandLineArguments();
+		}
+		BlurImg(imgIn, imgOut, threads, cores, threadPriorities);
 		std::cerr << std::difftime(std::clock(), begin) << "ms" << std::endl;
 	}
 	catch (const std::exception & ex)
